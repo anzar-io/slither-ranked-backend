@@ -9,8 +9,8 @@ const { calculateEloGain } = require('./elo');
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
-const PORT = Number(process.env.PORT) || 3000;
-const HOST = process.env.HOST || '127.0.0.1';      // 0.0.0.0 pour exposer le serveur
+const PORT = Number(process.env.PORT) || 10000;
+const HOST = process.env.HOST || '0.0.0.0';      // 0.0.0.0 pour exposer le serveur sur Render
 const ADMIN_KEY = process.env.ADMIN_KEY || '';      // vide = routes admin désactivées
 const DB_FILE = path.join(__dirname, 'players.json');
 
@@ -122,12 +122,10 @@ function newRecord(uuid, token, nickname) {
 // ---------------------------------------------------------------------------
 // Logique Elo
 // ---------------------------------------------------------------------------
-// Pure function: what would a match change, given the player's current Elo and rank?
 function computeMatch(elo, rank, score, duration) {
     const info = rankByName(rank);
     let eloChange = calculateEloGain(score, duration, rank, info.fee);
 
-    // Anti-exploit: fixed threshold from Mythic upwards (Pro is the top)
     const threshold = rank === 'Pro' ? null : info.max;
     if (threshold && HIGH_RANKS.includes(rank) && elo < threshold && elo + eloChange > threshold) {
         eloChange = (threshold - elo) + 15;
@@ -155,7 +153,6 @@ function applyMatch(rec, score, duration) {
     return { eloChange: r.eloChange, oldRank };
 }
 
-// Replays every non-cancelled match from zero. Used when a match is cancelled or restored.
 function recomputePlayer(rec) {
     rec.elo = 0;
     rec.rank = 'Bronze';
@@ -176,9 +173,7 @@ const publicMatch = (m) => ({ score: m.score, duration: m.duration, change: m.ch
 // ---------------------------------------------------------------------------
 const app = express();
 app.disable('x-powered-by');
-// Si tu mets un reverse proxy (nginx, Caddy...) devant : app.set('trust proxy', 1);
 app.use(express.json({ limit: '10kb' }));
-// Pas de CORS : GM_xmlhttpRequest (Tampermonkey) n'en a pas besoin, et le dashboard est same-origin.
 
 function requireAdmin(req, res, next) {
     if (!ADMIN_KEY) return res.status(404).json({ success: false, error: 'Not found' });
@@ -188,7 +183,7 @@ function requireAdmin(req, res, next) {
 }
 
 // ---------------------------------------------------------------------------
-// API publique (utilisée par le userscript)
+// API publique
 // ---------------------------------------------------------------------------
 app.get('/api/playerdata', (req, res) => {
     const playerId = req.query.playerId;
@@ -213,7 +208,6 @@ app.post('/api/matches/submit', (req, res) => {
     const b = req.body || {};
     const { playerId, playerToken } = b;
 
-    // Vérifications minimales de format (évite de corrompre la base avec des NaN / clés exotiques)
     if (typeof playerId !== 'string' || !ID_RE.test(playerId)) return res.status(400).json({ success: false, error: 'Invalid playerId' });
     if (typeof playerToken !== 'string' || playerToken.length < 16 || playerToken.length > 128) {
         return res.status(400).json({ success: false, error: 'Invalid playerToken' });
@@ -224,7 +218,6 @@ app.post('/api/matches/submit', (req, res) => {
         return res.status(400).json({ success: false, error: 'Invalid data' });
     }
 
-    // Authentification : le client génère un secret, le serveur retient son hash au 1er envoi
     let rec = db[playerId];
     if (!rec) {
         rec = db[playerId] = newRecord(playerId, playerToken, cleanNickname(b.nickname));
@@ -242,7 +235,7 @@ app.post('/api/matches/submit', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// API admin (désactivée tant que ADMIN_KEY n'est pas définie)
+// API admin
 // ---------------------------------------------------------------------------
 app.post('/api/admin/simulate', requireAdmin, (req, res) => {
     const rec = Object.values(db).find(p => p.publicId === req.body.publicId);
@@ -263,9 +256,6 @@ app.post('/api/admin/reset', requireAdmin, (req, res) => {
     res.json({ success: true });
 });
 
-// ---------------------------------------------------------------------------
-// Admin: review recent matches and cancel / restore them
-// ---------------------------------------------------------------------------
 app.get('/api/admin/matches', requireAdmin, (req, res) => {
     const rows = [];
     for (const rec of Object.values(db)) {
@@ -295,7 +285,6 @@ app.post('/api/admin/match', requireAdmin, (req, res) => {
     res.json({ success: true, newElo: rec.elo, newRank: rec.rank });
 });
 
-// The page itself contains no data: it asks for the admin key, then loads everything through the API above.
 app.get('/admin', (req, res) => {
     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -415,9 +404,6 @@ app.get('/admin', (req, res) => {
 </html>`);
 });
 
-// ---------------------------------------------------------------------------
-// Dashboard (lecture seule, aucune création de joueur via GET)
-// ---------------------------------------------------------------------------
 app.get('/', (req, res) => {
     const all = sortedPlayers();
     const requested = typeof req.query.player === 'string' ? req.query.player : '';
@@ -534,7 +520,6 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-// Erreurs (JSON invalide, corps trop gros...)
 app.use((err, req, res, next) => {
     if (err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) {
         return res.status(400).json({ success: false, error: 'Invalid request' });
