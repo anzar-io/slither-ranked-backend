@@ -212,12 +212,27 @@ const publicMatch = (m) => ({ score: m.score, duration: m.duration, change: m.ch
 // ---------------------------------------------------------------------------
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1);   // Render sits in front of the server: use the visitor's real IP
 app.use(express.json({ limit: '10kb' }));
+
+const adminFails = new Map();   // ip -> timestamps of wrong admin keys
+setInterval(() => adminFails.clear(), 15 * 60 * 1000).unref();
 
 function requireAdmin(req, res, next) {
     if (!ADMIN_KEY) return res.status(404).json({ success: false, error: 'Not found' });
+
+    const now = Date.now();
+    const fails = (adminFails.get(req.ip) || []).filter(t => now - t < 15 * 60 * 1000);
+    if (fails.length >= 10) {
+        return res.status(429).json({ success: false, error: 'Too many wrong admin keys, try again in 15 minutes' });
+    }
+
     const key = req.get('x-admin-key') || '';
-    if (!safeEqual(sha256(key), sha256(ADMIN_KEY))) return res.status(403).json({ success: false, error: 'Invalid admin key' });
+    if (!safeEqual(sha256(key), sha256(ADMIN_KEY))) {
+        fails.push(now);
+        adminFails.set(req.ip, fails);
+        return res.status(403).json({ success: false, error: 'Invalid admin key' });
+    }
     next();
 }
 
@@ -476,7 +491,7 @@ app.get('/', (req, res) => {
             </tr>`).join('') || `<tr><td colspan="4" style="color:#666;">No matches recorded yet.</td></tr>`;
 
         const adminPanel = ADMIN_KEY ? `
-            <div class="test-panel">
+            <div class="test-panel" id="admin-panel" style="display:none">
                 <div style="font-size:11px; color:#94a3b8; margin-bottom:6px;">Admin tools for: ${esc(player.name)}</div>
                 <button onclick="admin('/api/admin/simulate', 20000, 1800)">🧪 Test 20k</button>
                 <button onclick="admin('/api/admin/simulate', 50000, 2400)">🧪 Test 50k</button>
@@ -545,6 +560,8 @@ app.get('/', (req, res) => {
     </div>
     <script>
         var PLAYER_PUBLIC_ID = ${jsonForScript(player ? player.publicId : null)};
+        // The admin tools are hidden for visitors. Open this page with #admin at the end of the address to see them.
+        if (location.hash === '#admin') { var ap = document.getElementById('admin-panel'); if (ap) ap.style.display = 'block'; }
         async function admin(url, score, duration) {
             var key = sessionStorage.getItem('adminKey') || prompt('Admin key');
             if (!key) return;
