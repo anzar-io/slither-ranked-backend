@@ -12,7 +12,13 @@ const { calculateEloGain } = require('./elo');
 const PORT = Number(process.env.PORT) || 10000;
 const HOST = process.env.HOST || '0.0.0.0';      // 0.0.0.0 pour exposer le serveur sur Render
 const ADMIN_KEY = process.env.ADMIN_KEY || '';      // vide = routes admin désactivées
-const DB_FILE = path.join(__dirname, 'players.json');
+// DATA_DIR = dossier où players.json est stocké. Sur Render, pointe-le vers le disque persistant (ex: /var/data).
+const DATA_DIR = process.env.DATA_DIR || __dirname;
+fs.mkdirSync(DATA_DIR, { recursive: true });
+const DB_FILE = path.join(DATA_DIR, 'players.json');
+if (process.env.RENDER && !process.env.DATA_DIR && !process.env.DATABASE_URL) {
+    console.warn('⚠️ Neither DATABASE_URL nor DATA_DIR is set: players.json is on a temporary disk and will be LOST at every restart/redeploy.');
+}
 
 const LIMITS = {
     LEADERBOARD_SIZE: 50,
@@ -61,10 +67,27 @@ function esc(s) {
 const jsonForScript = (v) => JSON.stringify(v).replace(/</g, '\\u003c');
 
 // ---------------------------------------------------------------------------
-// Base de données (fichier JSON, clé = UUID du joueur)
+// Storage: PostgreSQL if DATABASE_URL is set (recommended online), otherwise the players.json file
 // ---------------------------------------------------------------------------
-let db = {};
+const DATABASE_URL = process.env.DATABASE_URL || '';
+let db = {};              // all players, kept in memory, key = player UUID
+let pool = null;          // PostgreSQL connection pool (only when DATABASE_URL is set)
+let writeChain = Promise.resolve();
 
+// Checks a stored record and fills in missing fields. Returns false if the record must be ignored.
+function acceptRecord(id, rec) {
+    if (!(ID_RE.test(id) && rec && rec.tokenHash && rec.publicId)) return false;
+    rec.matches = Array.isArray(rec.matches) ? rec.matches : [];
+    for (const m of rec.matches) {
+        if (!m.id) m.id = crypto.randomUUID();
+        if (typeof m.at !== 'number') m.at = 0;
+        m.cancelled = m.cancelled === true;
+    }
+    db[id] = rec;
+    return true;
+}
+
+// ----- file mode -----
 function loadDatabase() {
     if (!fs.existsSync(DB_FILE)) return;
     let raw;
@@ -78,17 +101,7 @@ function loadDatabase() {
     }
     let dropped = 0;
     for (const [id, rec] of Object.entries(raw || {})) {
-        if (ID_RE.test(id) && rec && rec.tokenHash && rec.publicId) {
-            rec.matches = Array.isArray(rec.matches) ? rec.matches : [];
-            for (const m of rec.matches) {
-                if (!m.id) m.id = crypto.randomUUID();
-                if (typeof m.at !== 'number') m.at = 0;
-                m.cancelled = m.cancelled === true;
-            }
-            db[id] = rec;
-        } else {
-            dropped++;
-        }
+        if (!acceptRecord(id, rec)) dropped++;
     }
     if (dropped > 0) {
         const backup = `${DB_FILE}.legacy-${Date.now()}`;
@@ -101,10 +114,36 @@ function loadDatabase() {
 function saveDatabase() {
     const tmp = DB_FILE + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(db, null, 2), 'utf8');
-    fs.renameSync(tmp, DB_FILE); // écriture atomique
+    fs.renameSync(tmp, DB_FILE); // atomic write
 }
 
-loadDatabase();
+// ----- PostgreSQL mode (one row per player) -----
+async function loadDatabaseFromPostgres() {
+    const { Pool } = require('pg');
+    pool = new Pool({ connectionString: DATABASE_URL, max: 5 });
+    pool.on('error', (e) => console.error('[DB] idle connection error:', e.message));
+    await pool.query('CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY, data JSONB NOT NULL)');
+    const result = await pool.query('SELECT id, data FROM players');
+    for (const row of result.rows) acceptRecord(row.id, row.data);
+    console.log(`🐘 ${Object.keys(db).length} player(s) loaded from PostgreSQL`);
+}
+
+// Saves one player. Writes are queued one after the other so an older version can never overwrite a newer one.
+// A failed write never crashes the server: the next save of that player writes the full record again.
+function persistPlayer(uuid) {
+    if (!pool) { saveDatabase(); return Promise.resolve(); }
+    const json = JSON.stringify(db[uuid]);
+    writeChain = writeChain
+        .then(() => pool.query(
+            'INSERT INTO players (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data',
+            [uuid, json]))
+        .catch((e) => console.error('[DB] write failed:', e.message));
+    return writeChain;
+}
+
+function findByPublicId(publicId) {
+    return Object.entries(db).find(([, p]) => p.publicId === publicId) || null;
+}
 
 const sortedPlayers = () => Object.values(db).sort((a, b) => b.elo - a.elo);
 
@@ -204,7 +243,7 @@ app.get('/api/playerdata', (req, res) => {
     res.json({ success: true, player, leaderboard });
 });
 
-app.post('/api/matches/submit', (req, res) => {
+app.post('/api/matches/submit', async (req, res) => {
     const b = req.body || {};
     const { playerId, playerToken } = b;
 
@@ -228,7 +267,7 @@ app.post('/api/matches/submit', (req, res) => {
     rec.name = cleanNickname(b.nickname);
 
     const { eloChange, oldRank } = applyMatch(rec, score, duration);
-    saveDatabase();
+    await persistPlayer(playerId);
 
     console.log(`[MATCH] ${rec.name} | Old rank: ${oldRank} | Score: ${score} | Duration: ${duration}s | Delta: ${eloChange} | Total: ${rec.elo} Elo (${rec.rank})`);
     res.json({ success: true, eloChange, newElo: rec.elo, newRank: rec.rank });
@@ -237,21 +276,23 @@ app.post('/api/matches/submit', (req, res) => {
 // ---------------------------------------------------------------------------
 // API admin
 // ---------------------------------------------------------------------------
-app.post('/api/admin/simulate', requireAdmin, (req, res) => {
-    const rec = Object.values(db).find(p => p.publicId === req.body.publicId);
+app.post('/api/admin/simulate', requireAdmin, async (req, res) => {
+    const found = findByPublicId(req.body.publicId);
     const score = Math.floor(Number(req.body.score));
     const duration = Math.floor(Number(req.body.duration)) || 120;
-    if (!rec || !Number.isFinite(score) || score <= 0) return res.status(400).json({ success: false, error: 'Invalid parameters' });
+    if (!found || !Number.isFinite(score) || score <= 0) return res.status(400).json({ success: false, error: 'Invalid parameters' });
+    const [uuid, rec] = found;
     const result = applyMatch(rec, score, duration);
-    saveDatabase();
+    await persistPlayer(uuid);
     res.json({ success: true, ...result, newElo: rec.elo, newRank: rec.rank });
 });
 
-app.post('/api/admin/reset', requireAdmin, (req, res) => {
-    const rec = Object.values(db).find(p => p.publicId === req.body.publicId);
-    if (!rec) return res.status(404).json({ success: false, error: 'Player not found' });
+app.post('/api/admin/reset', requireAdmin, async (req, res) => {
+    const found = findByPublicId(req.body.publicId);
+    if (!found) return res.status(404).json({ success: false, error: 'Player not found' });
+    const [uuid, rec] = found;
     rec.elo = 0; rec.rank = 'Bronze'; rec.matches = [];
-    saveDatabase();
+    await persistPlayer(uuid);
     console.log(`[RESET] Profile of ${rec.name} was reset.`);
     res.json({ success: true });
 });
@@ -272,15 +313,16 @@ app.get('/api/admin/matches', requireAdmin, (req, res) => {
     res.json({ success: true, matches: rows.slice(0, LIMITS.ADMIN_MATCH_LIST) });
 });
 
-app.post('/api/admin/match', requireAdmin, (req, res) => {
+app.post('/api/admin/match', requireAdmin, async (req, res) => {
     const { publicId, matchId, cancelled } = req.body || {};
-    const rec = Object.values(db).find(p => p.publicId === publicId);
+    const found = findByPublicId(publicId);
+    const rec = found && found[1];
     const match = rec && rec.matches.find(m => m.id === matchId);
     if (!match || typeof cancelled !== 'boolean') return res.status(400).json({ success: false, error: 'Invalid parameters' });
 
     match.cancelled = cancelled;
     recomputePlayer(rec);
-    saveDatabase();
+    await persistPlayer(found[0]);
     console.log(`[ADMIN] Match of ${rec.name} (${match.score} pts) ${cancelled ? 'cancelled' : 'restored'}. New total: ${rec.elo} Elo (${rec.rank})`);
     res.json({ success: true, newElo: rec.elo, newRank: rec.rank });
 });
@@ -528,6 +570,16 @@ app.use((err, req, res, next) => {
     res.status(500).json({ success: false, error: 'Server error' });
 });
 
-app.listen(PORT, HOST, () => {
-    console.log(`🚀 Ranked server running on http://${HOST}:${PORT}${ADMIN_KEY ? ' (admin enabled)' : ''}`);
+async function start() {
+    if (DATABASE_URL) await loadDatabaseFromPostgres();
+    else loadDatabase();
+
+    app.listen(PORT, HOST, () => {
+        console.log(`🚀 Ranked server running on http://${HOST}:${PORT}${ADMIN_KEY ? ' (admin enabled)' : ''}`);
+    });
+}
+
+start().catch((e) => {
+    console.error('Could not start the server:', e);
+    process.exit(1);
 });
