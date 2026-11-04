@@ -72,7 +72,7 @@ const jsonForScript = (v) => JSON.stringify(v).replace(/</g, '\\u003c');
 const DATABASE_URL = process.env.DATABASE_URL || '';
 let db = {};              // all players, kept in memory, key = player UUID
 let pool = null;          // PostgreSQL connection pool (only when DATABASE_URL is set)
-let writeChain = Promise.resolve();
+
 
 // Checks a stored record and fills in missing fields. Returns false if the record must be ignored.
 function acceptRecord(id, rec) {
@@ -128,17 +128,26 @@ async function loadDatabaseFromPostgres() {
     console.log(`🐘 ${Object.keys(db).length} player(s) loaded from PostgreSQL`);
 }
 
-// Saves one player. Writes are queued one after the other so an older version can never overwrite a newer one.
-// A failed write never crashes the server: the next save of that player writes the full record again.
-function persistPlayer(uuid) {
-    if (!pool) { saveDatabase(); return Promise.resolve(); }
+// Sauvegarde sécurisée d'un joueur avec ré-essai automatique en cas de saturation temporaire du pool Neon
+async function persistPlayer(uuid) {
+    if (!pool) { saveDatabase(); return; }
     const json = JSON.stringify(db[uuid]);
-    writeChain = writeChain
-        .then(() => pool.query(
-            'INSERT INTO players (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data',
-            [uuid, json]))
-        .catch((e) => console.error('[DB] write failed:', e.message));
-    return writeChain;
+    
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            await pool.query(
+                'INSERT INTO players (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data',
+                [uuid, json]
+            );
+            return;
+        } catch (e) {
+            if (attempt === 3) {
+                console.error(`[DB] Échec critique d'écriture pour ${uuid} après 3 essais:`, e.message);
+            } else {
+                await new Promise(resolve => setTimeout(resolve, 200 * attempt));
+            }
+        }
+    }
 }
 
 function findByPublicId(publicId) {
