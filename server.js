@@ -1,6 +1,7 @@
 'use strict';
 
 const express = require('express');
+const cors = require('cors'); // <--- AJOUTER ICI
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -222,6 +223,7 @@ const publicMatch = (m) => ({ score: m.score, duration: m.duration, change: m.ch
 const app = express();
 app.disable('x-powered-by');
 app.set('trust proxy', 1);   // Render sits in front of the server: use the visitor's real IP
+app.use(cors());
 app.use(express.json({ limit: '10kb' }));
 
 const adminFails = new Map();   // ip -> timestamps of wrong admin keys
@@ -271,20 +273,30 @@ app.post('/api/matches/submit', async (req, res) => {
     const b = req.body || {};
     const { playerId, playerToken } = b;
 
-    if (typeof playerId !== 'string' || !ID_RE.test(playerId)) return res.status(400).json({ success: false, error: 'Invalid playerId' });
+    // LOG DE DEBUG DE TOUTES LES TENTATIVES ENTRANTES
+    console.log(`[RECEIVE SUBMIT] ID: ${playerId} | Token length: ${playerToken ? playerToken.length : 0} | Score: ${b.finalScore}`);
+
+    if (typeof playerId !== 'string' || !ID_RE.test(playerId)) {
+        console.warn(`[REJECT] Format playerId invalide: "${playerId}"`);
+        return res.status(400).json({ success: false, error: 'Invalid playerId' });
+    }
     if (typeof playerToken !== 'string' || playerToken.length < 16 || playerToken.length > 128) {
+        console.warn(`[REJECT] Token invalide pour ${playerId}`);
         return res.status(400).json({ success: false, error: 'Invalid playerToken' });
     }
     const score = Math.floor(Number(b.finalScore));
     const duration = Math.floor(Number(b.durationSeconds));
     if (!Number.isFinite(score) || score <= 0 || !Number.isFinite(duration) || duration <= 0) {
+        console.warn(`[REJECT] Score ou durée invalide pour ${playerId}: score=${score}, duration=${duration}`);
         return res.status(400).json({ success: false, error: 'Invalid data' });
     }
 
     let rec = db[playerId];
     if (!rec) {
+        console.log(`[DB] Création d'un nouveau profil pour ${playerId}`);
         rec = db[playerId] = newRecord(playerId, playerToken, cleanNickname(b.nickname));
     } else if (!safeEqual(sha256(playerToken), rec.tokenHash)) {
+        console.warn(`[REJECT] Token security mismatch pour ${playerId}`);
         return res.status(403).json({ success: false, error: 'Invalid token' });
     }
 
@@ -292,15 +304,13 @@ app.post('/api/matches/submit', async (req, res) => {
 
     const { eloChange, oldRank } = applyMatch(rec, score, duration);
 
-    // 1. ON RÉPOND IMMÉDIATEMENT AU CLIENT (0 attente, zéro blocage réseau)
     res.json({ success: true, eloChange, newElo: rec.elo, newRank: rec.rank });
 
-    // 2. ON PERSISTE EN ARRIÈRE-PLAN (Non bloquant)
     persistPlayer(playerId).catch(err => {
         console.error(`[DB] background write failed for ${playerId}:`, err.message);
     });
 
-    console.log(`[MATCH] ${rec.name} | Old rank: ${oldRank} | Score: ${score} | Duration: ${duration}s | Delta: ${eloChange} | Total: ${rec.elo} Elo (${rec.rank})`);
+    console.log(`[MATCH SUCCESS] ${rec.name} | Score: ${score} | Delta: ${eloChange} | Total: ${rec.elo} Elo`);
 });
 
 // ---------------------------------------------------------------------------
