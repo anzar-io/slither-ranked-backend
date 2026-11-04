@@ -121,8 +121,16 @@ function saveDatabase() {
 // ----- PostgreSQL mode (one row per player) -----
 async function loadDatabaseFromPostgres() {
     const { Pool } = require('pg');
-    pool = new Pool({ connectionString: DATABASE_URL, max: 5 });
+    pool = new Pool({ 
+        connectionString: DATABASE_URL, 
+        max: 5,
+        ssl: { rejectUnauthorized: false }, // Indispensable pour sécuriser la connexion avec Neon
+        idleTimeoutMillis: 30000,          // Ferme proprement les connexions inactives au bout de 30s
+        connectionTimeoutMillis: 10000     // Laisse 10 secondes à Neon pour sortir de veille sans planter
+    });
+    
     pool.on('error', (e) => console.error('[DB] idle connection error:', e.message));
+    
     await pool.query('CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY, data JSONB NOT NULL)');
     const result = await pool.query('SELECT id, data FROM players');
     for (const row of result.rows) acceptRecord(row.id, row.data);
