@@ -208,13 +208,14 @@ function computeMatch(elo, rank, score, duration) {
     return { eloChange, newElo, newRank: rankFromElo(newElo) };
 }
 
-function applyMatch(rec, score, duration) {
+function applyMatch(rec, score, duration, gameId) {
     const oldRank = rec.rank;
     const r = computeMatch(rec.elo, rec.rank, score, duration);
     rec.elo = r.newElo;
     rec.rank = r.newRank;
     rec.matches.push({
         id: crypto.randomUUID(),
+        gameId: gameId || null,
         score,
         duration,
         change: r.eloChange,
@@ -315,7 +316,14 @@ app.post('/api/matches/submit', async (req, res) => {
 
     rec.name = cleanNickname(b.nickname);
 
-    const { eloChange, oldRank } = applyMatch(rec, score, duration);
+    // The same game can arrive twice (the player's script retries). It must only count once.
+    const gameId = (typeof b.gameId === 'string' && /^match_[a-z0-9]{1,16}_\d{10,15}$/.test(b.gameId)) ? b.gameId : null;
+    if (gameId) {
+        const dup = rec.matches.find(m => m.gameId === gameId);
+        if (dup) return res.json({ success: true, eloChange: dup.change, newElo: rec.elo, newRank: rec.rank, duplicate: true });
+    }
+
+    const { eloChange, oldRank } = applyMatch(rec, score, duration, gameId);
     persistPlayer(playerId);   // saved in the background (with retries): the player never waits for the database
 
     console.log(`[MATCH] ${rec.name} | Old rank: ${oldRank} | Score: ${score} | Duration: ${duration}s | Delta: ${eloChange} | Total: ${rec.elo} Elo (${rec.rank})`);
