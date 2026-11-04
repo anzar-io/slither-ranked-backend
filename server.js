@@ -1,7 +1,7 @@
 'use strict';
 
 const express = require('express');
-const cors = require('cors'); // <--- AJOUTER ICI
+const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -73,7 +73,7 @@ const jsonForScript = (v) => JSON.stringify(v).replace(/</g, '\\u003c');
 const DATABASE_URL = process.env.DATABASE_URL || '';
 let db = {};              // all players, kept in memory, key = player UUID
 let pool = null;          // PostgreSQL connection pool (only when DATABASE_URL is set)
-
+let writeChain = Promise.resolve();
 
 // Checks a stored record and fills in missing fields. Returns false if the record must be ignored.
 function acceptRecord(id, rec) {
@@ -121,42 +121,57 @@ function saveDatabase() {
 // ----- PostgreSQL mode (one row per player) -----
 async function loadDatabaseFromPostgres() {
     const { Pool } = require('pg');
-    pool = new Pool({ 
-        connectionString: DATABASE_URL, 
+    pool = new Pool({
+        connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false },
         max: 5,
-        ssl: { rejectUnauthorized: false }, // Indispensable pour sécuriser la connexion avec Neon
-        idleTimeoutMillis: 30000,          // Ferme proprement les connexions inactives au bout de 30s
-        connectionTimeoutMillis: 10000     // Laisse 10 secondes à Neon pour sortir de veille sans planter
+        connectionTimeoutMillis: 15000,   // waking Neon can take a few seconds, but never wait forever
+        query_timeout: 15000,             // a query that hangs is cut after 15 s instead of blocking everything
+        idleTimeoutMillis: 10000,         // drop idle connections before Neon silently kills them
+        keepAlive: true
     });
-    
     pool.on('error', (e) => console.error('[DB] idle connection error:', e.message));
-    
     await pool.query('CREATE TABLE IF NOT EXISTS players (id TEXT PRIMARY KEY, data JSONB NOT NULL)');
     const result = await pool.query('SELECT id, data FROM players');
     for (const row of result.rows) acceptRecord(row.id, row.data);
     console.log(`🐘 ${Object.keys(db).length} player(s) loaded from PostgreSQL`);
 }
 
-// Sauvegarde sécurisée d'un joueur avec ré-essai automatique en cas de saturation temporaire du pool Neon
-async function persistPlayer(uuid) {
-    if (!pool) { saveDatabase(); return; }
+// ----- Saving players -----
+// Every change marks the player as "dirty". A write is retried up to 3 times, and anything still dirty is
+// retried every 30 s and when the server stops. So a slow or sleeping database delays a save but does not lose it,
+// and one stuck query can never block the saves of all the other players.
+const UPSERT_SQL = 'INSERT INTO players (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data';
+const dirty = new Map();   // uuid -> version number of the latest change
+let versionCounter = 0;
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function writePlayer(uuid) {
+    const version = dirty.get(uuid);
+    if (version === undefined) return true;
     const json = JSON.stringify(db[uuid]);
-    
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            await pool.query(
-                'INSERT INTO players (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data',
-                [uuid, json]
-            );
-            return;
+            await pool.query(UPSERT_SQL, [uuid, json]);
+            if (dirty.get(uuid) === version) dirty.delete(uuid);   // keep it dirty if it changed during the write
+            return true;
         } catch (e) {
-            if (attempt === 3) {
-                console.error(`[DB] Échec critique d'écriture pour ${uuid} après 3 essais:`, e.message);
-            } else {
-                await new Promise(resolve => setTimeout(resolve, 200 * attempt));
-            }
+            console.error(`[DB] write failed for ${db[uuid] && db[uuid].name} (attempt ${attempt}/3): ${e.message}`);
+            if (attempt < 3) await sleep(1000 * attempt);
         }
     }
+    return false;
+}
+
+async function flushDirty() {
+    for (const uuid of [...dirty.keys()]) await writePlayer(uuid);
+    if (dirty.size > 0) console.warn(`[DB] ${dirty.size} player(s) still waiting to be saved`);
+}
+
+function persistPlayer(uuid) {
+    if (!pool) { saveDatabase(); return Promise.resolve(); }
+    dirty.set(uuid, ++versionCounter);
+    writeChain = writeChain.then(() => writePlayer(uuid)).catch((e) => console.error('[DB] unexpected:', e.message));
+    return writeChain;
 }
 
 function findByPublicId(publicId) {
@@ -281,44 +296,30 @@ app.post('/api/matches/submit', async (req, res) => {
     const b = req.body || {};
     const { playerId, playerToken } = b;
 
-    // LOG DE DEBUG DE TOUTES LES TENTATIVES ENTRANTES
-    console.log(`[RECEIVE SUBMIT] ID: ${playerId} | Token length: ${playerToken ? playerToken.length : 0} | Score: ${b.finalScore}`);
-
-    if (typeof playerId !== 'string' || !ID_RE.test(playerId)) {
-        console.warn(`[REJECT] Format playerId invalide: "${playerId}"`);
-        return res.status(400).json({ success: false, error: 'Invalid playerId' });
-    }
+    if (typeof playerId !== 'string' || !ID_RE.test(playerId)) return res.status(400).json({ success: false, error: 'Invalid playerId' });
     if (typeof playerToken !== 'string' || playerToken.length < 16 || playerToken.length > 128) {
-        console.warn(`[REJECT] Token invalide pour ${playerId}`);
         return res.status(400).json({ success: false, error: 'Invalid playerToken' });
     }
     const score = Math.floor(Number(b.finalScore));
     const duration = Math.floor(Number(b.durationSeconds));
     if (!Number.isFinite(score) || score <= 0 || !Number.isFinite(duration) || duration <= 0) {
-        console.warn(`[REJECT] Score ou durée invalide pour ${playerId}: score=${score}, duration=${duration}`);
         return res.status(400).json({ success: false, error: 'Invalid data' });
     }
 
     let rec = db[playerId];
     if (!rec) {
-        console.log(`[DB] Création d'un nouveau profil pour ${playerId}`);
         rec = db[playerId] = newRecord(playerId, playerToken, cleanNickname(b.nickname));
     } else if (!safeEqual(sha256(playerToken), rec.tokenHash)) {
-        console.warn(`[REJECT] Token security mismatch pour ${playerId}`);
         return res.status(403).json({ success: false, error: 'Invalid token' });
     }
 
     rec.name = cleanNickname(b.nickname);
 
     const { eloChange, oldRank } = applyMatch(rec, score, duration);
+    persistPlayer(playerId);   // saved in the background (with retries): the player never waits for the database
 
+    console.log(`[MATCH] ${rec.name} | Old rank: ${oldRank} | Score: ${score} | Duration: ${duration}s | Delta: ${eloChange} | Total: ${rec.elo} Elo (${rec.rank})`);
     res.json({ success: true, eloChange, newElo: rec.elo, newRank: rec.rank });
-
-    persistPlayer(playerId).catch(err => {
-        console.error(`[DB] background write failed for ${playerId}:`, err.message);
-    });
-
-    console.log(`[MATCH SUCCESS] ${rec.name} | Score: ${score} | Delta: ${eloChange} | Total: ${rec.elo} Elo`);
 });
 
 // ---------------------------------------------------------------------------
@@ -623,6 +624,19 @@ app.use((err, req, res, next) => {
 async function start() {
     if (DATABASE_URL) await loadDatabaseFromPostgres();
     else loadDatabase();
+
+    if (pool) setInterval(() => flushDirty().catch(() => {}), 30000).unref();
+
+    // Render stops the old server on every deploy/restart: save everything still pending first.
+    const shutdown = async (signal) => {
+        console.log(`${signal} received, saving pending players...`);
+        const timer = setTimeout(() => process.exit(0), 8000);
+        try { if (pool) await flushDirty(); } catch (e) {}
+        clearTimeout(timer);
+        process.exit(0);
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT', () => shutdown('SIGINT'));
 
     app.listen(PORT, HOST, () => {
         console.log(`🚀 Ranked server running on http://${HOST}:${PORT}${ADMIN_KEY ? ' (admin enabled)' : ''}`);
