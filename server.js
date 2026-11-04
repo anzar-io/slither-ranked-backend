@@ -282,10 +282,16 @@ app.post('/api/matches/submit', async (req, res) => {
     rec.name = cleanNickname(b.nickname);
 
     const { eloChange, oldRank } = applyMatch(rec, score, duration);
-    await persistPlayer(playerId);
+
+    // 1. ON RÉPOND IMMÉDIATEMENT AU CLIENT (0 attente, zéro blocage réseau)
+    res.json({ success: true, eloChange, newElo: rec.elo, newRank: rec.rank });
+
+    // 2. ON PERSISTE EN ARRIÈRE-PLAN (Non bloquant)
+    persistPlayer(playerId).catch(err => {
+        console.error(`[DB] background write failed for ${playerId}:`, err.message);
+    });
 
     console.log(`[MATCH] ${rec.name} | Old rank: ${oldRank} | Score: ${score} | Duration: ${duration}s | Delta: ${eloChange} | Total: ${rec.elo} Elo (${rec.rank})`);
-    res.json({ success: true, eloChange, newElo: rec.elo, newRank: rec.rank });
 });
 
 // ---------------------------------------------------------------------------
