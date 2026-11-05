@@ -613,7 +613,7 @@ app.get('/admin', (req, res) => {
                 b.textContent = p.hidden ? 'Restore' : 'Hide';
                 if (!p.hidden) b.className = 'danger';
                 b.onclick = async function() {
-                    var msg = (p.hidden ? 'Restore' : 'Hide from leaderboard') + ' ONLY this profile?\n\n' + p.name + ' | ' + p.rank + ' | ' + p.elo + ' Elo | ' + p.games + ' games | id ' + p.publicId;
+                    var msg = (p.hidden ? 'Restore' : 'Hide from leaderboard') + ' ONLY this profile?\\n\\n' + p.name + ' | ' + p.rank + ' | ' + p.elo + ' Elo | ' + p.games + ' games | id ' + p.publicId;
                     if (!confirm(msg)) return;
                     var r = await api('/api/admin/player', { publicId: p.publicId, hidden: !p.hidden });
                     if (!r.ok) { alert('Error ' + r.status); return; }
@@ -623,7 +623,7 @@ app.get('/admin', (req, res) => {
                 add.textContent = '+/- Elo';
                 add.style.marginLeft = '6px';
                 add.onclick = async function() {
-                    var v = prompt('Add Elo to ' + p.name + ' (' + p.rank + ', ' + p.elo + ' Elo, id ' + p.publicId + ').\nType a number (use a minus sign to remove):');
+                    var v = prompt('Add Elo to ' + p.name + ' (' + p.rank + ', ' + p.elo + ' Elo, id ' + p.publicId + ').\\nType a number (use a minus sign to remove):');
                     if (v === null || v === '') return;
                     var amount = Number(v);
                     if (!isFinite(amount) || amount === 0) { alert('Not a valid number'); return; }
