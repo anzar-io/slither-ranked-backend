@@ -36,7 +36,11 @@ const RANKS = [
     { name: 'Master',     min: 12000, max: 15000, fee: 100 },
     { name: 'Pro',        min: 15000, max: 25000, fee: 135 }
 ];
-const HIGH_RANKS = ['Mythic', 'Legendary', 'Master']; // palier fixe anti-exploit
+const HIGH_RANKS = ['Mythic', 'Legendary', 'Master']; // ranks where a big game is split between the old and the new rank
+
+// Official ranked game servers. A game played elsewhere is still saved, but flagged in /admin so you can cancel it.
+const OFFICIAL_SERVERS = ['92.222.100.202:444', '198.244.231.35:444', '57.129.37.42:444'];
+const cleanServer = (v) => (typeof v === 'string' && /^[0-9a-zA-Z.:\[\]-]{3,60}$/.test(v)) ? v : '';
 
 const rankByName = (name) => RANKS.find(r => r.name === name) || RANKS[0];
 const rankFromElo = (elo) => {
@@ -137,48 +141,82 @@ async function loadDatabaseFromPostgres() {
 }
 
 // ----- Saving players -----
-// Every change marks the player as "dirty". A write is retried up to 3 times, and anything still dirty is
-// retried every 30 s and when the server stops. So a slow or sleeping database delays a save but does not lose it,
-// and one stuck query can never block the saves of all the other players.
-const UPSERT_SQL = 'INSERT INTO players (id, data) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data';
+// Every change marks the player as "dirty". Saves are grouped: after a change the server waits 2 seconds, then writes
+// ALL changed players in ONE database request (so 8 games ending together cost 1 write, not 8). A failed write is
+// retried 3 times, and anything still dirty is retried every 30 s and when the server stops. A slow or sleeping
+// database delays a save but never loses it, and the player never waits for it.
+const BATCH_SQL = 'INSERT INTO players (id, data) SELECT t.id, t.data::jsonb FROM unnest($1::text[], $2::text[]) AS t(id, data) ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data';
+const FLUSH_DELAY_MS = 2000;
 const dirty = new Map();   // uuid -> version number of the latest change
 let versionCounter = 0;
+let flushPromise = null;   // a grouped save is already scheduled
+let flushChain = Promise.resolve();   // saves run one after the other, so an old save can never overwrite a newer one
+const stats = { changed: 0, saved: 0, failed: 0 };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-async function writePlayer(uuid) {
-    const version = dirty.get(uuid);
-    if (version === undefined) return true;
-    const json = JSON.stringify(db[uuid]);
+async function doFlush() {
+    const batch = [...dirty.entries()].filter(([uuid]) => db[uuid]);
+    if (batch.length === 0) { dirty.clear(); return true; }
+    const ids = batch.map(([uuid]) => uuid);
+    const datas = batch.map(([uuid]) => JSON.stringify(db[uuid]));
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            await pool.query(UPSERT_SQL, [uuid, json]);
-            if (dirty.get(uuid) === version) dirty.delete(uuid);   // keep it dirty if it changed during the write
+            await pool.query(BATCH_SQL, [ids, datas]);
+            for (const [uuid, version] of batch) if (dirty.get(uuid) === version) dirty.delete(uuid);   // keep it dirty if it changed meanwhile
+            stats.saved += batch.length;
             return true;
         } catch (e) {
-            console.error(`[DB] write failed for ${db[uuid] && db[uuid].name} (attempt ${attempt}/3): ${e.message}`);
+            stats.failed++;
+            console.error(`[DB] write failed for ${batch.length} player(s) (attempt ${attempt}/3): ${e.message}`);
             if (attempt < 3) await sleep(1000 * attempt);
         }
     }
     return false;
 }
 
+function flushOnce() {
+    const p = flushChain.then(doFlush);
+    flushChain = p.catch(() => {});
+    return p;
+}
+
 async function flushDirty() {
-    for (const uuid of [...dirty.keys()]) await writePlayer(uuid);
+    if (flushPromise) await flushPromise.catch(() => {});
+    await flushOnce();
     if (dirty.size > 0) console.warn(`[DB] ${dirty.size} player(s) still waiting to be saved`);
 }
 
 function persistPlayer(uuid) {
     if (!pool) { saveDatabase(); return Promise.resolve(); }
     dirty.set(uuid, ++versionCounter);
-    writeChain = writeChain.then(() => writePlayer(uuid)).catch((e) => console.error('[DB] unexpected:', e.message));
-    return writeChain;
+    stats.changed++;
+    if (!flushPromise) {
+        flushPromise = (async () => {
+            try {
+                let ok = true;
+                do { await sleep(FLUSH_DELAY_MS); ok = await flushOnce(); } while (ok && dirty.size > 0);
+            } catch (e) {
+                console.error('[DB] unexpected:', e.message);
+            } finally {
+                flushPromise = null;
+            }
+        })();
+    }
+    return flushPromise;
 }
+
+// One summary line per minute (only when something happened), to see at a glance if saves keep up.
+setInterval(() => {
+    if (!pool || (stats.changed === 0 && stats.failed === 0 && dirty.size === 0)) return;
+    console.log(`[STATS] last minute: ${stats.changed} change(s), ${stats.saved} saved, ${stats.failed} failed attempt(s), ${dirty.size} waiting`);
+    stats.changed = stats.saved = stats.failed = 0;
+}, 60000).unref();
 
 function findByPublicId(publicId) {
     return Object.entries(db).find(([, p]) => p.publicId === publicId) || null;
 }
 
-const sortedPlayers = () => Object.values(db).sort((a, b) => b.elo - a.elo);
+const sortedPlayers = () => Object.values(db).filter(p => !p.hidden).sort((a, b) => b.elo - a.elo);
 
 function newRecord(uuid, token, nickname) {
     return {
@@ -194,21 +232,35 @@ function newRecord(uuid, token, nickname) {
 // ---------------------------------------------------------------------------
 // Logique Elo
 // ---------------------------------------------------------------------------
+// The fee is paid once per game. For Mythic / Legendary / Master, when a game is big enough to cross into the next rank,
+// the part of the game needed to fill the current rank to 100% is paid with the CURRENT rank's formula, and the rest of
+// the game (the surplus) is paid with the NEW rank's formula. A single game can therefore cross several ranks if it is huge,
+// but every rank it goes through pays at its own rate.
 function computeMatch(elo, rank, score, duration) {
-    const info = rankByName(rank);
-    let eloChange = calculateEloGain(score, duration, rank, info.fee);
-
-    const threshold = rank === 'Pro' ? null : info.max;
-    if (threshold && HIGH_RANKS.includes(rank) && elo < threshold && elo + eloChange > threshold) {
-        eloChange = (threshold - elo) + 15;
-        console.log(`[FIXED THRESHOLD] Fixed threshold applied for ${rank}. Gain capped at ${eloChange} Elo.`);
+    let e = elo - rankByName(rank).fee;   // Elo after paying the entry fee
+    let r = rank;
+    let remaining = 1;                    // share of the game not paid yet
+    for (let step = 0; step < 4; step++) {
+        const info = rankByName(r);
+        const part = calculateEloGain(score, duration, r, 0) * remaining;   // what this rank would pay for the remaining share
+        const canCross = HIGH_RANKS.includes(r) && r !== 'Pro';
+        if (canCross && part > 0 && e < info.max && e + part > info.max) {
+            const need = info.max - e;
+            remaining *= (1 - need / part);
+            e = info.max;
+            r = rankFromElo(e);
+            console.log(`[RANK UP] Crossing ${info.name} -> ${r}: ${Math.round(need)} Elo paid at ${info.name} rate, surplus paid at ${r} rate.`);
+            continue;
+        }
+        e += part;
+        break;
     }
-
+    const eloChange = Math.round(e - elo);
     const newElo = Math.max(0, elo + eloChange);
     return { eloChange, newElo, newRank: rankFromElo(newElo) };
 }
 
-function applyMatch(rec, score, duration, gameId) {
+function applyMatch(rec, score, duration, gameId, server) {
     const oldRank = rec.rank;
     const r = computeMatch(rec.elo, rec.rank, score, duration);
     rec.elo = r.newElo;
@@ -216,6 +268,7 @@ function applyMatch(rec, score, duration, gameId) {
     rec.matches.push({
         id: crypto.randomUUID(),
         gameId: gameId || null,
+        server: server || '',
         score,
         duration,
         change: r.eloChange,
@@ -231,6 +284,11 @@ function recomputePlayer(rec) {
     rec.rank = 'Bronze';
     for (const m of rec.matches) {
         if (m.cancelled) { m.change = 0; continue; }
+        if (m.manual) {   // a manual admin adjustment: a fixed number of Elo, never recalculated
+            rec.elo = Math.max(0, rec.elo + m.change);
+            rec.rank = rankFromElo(rec.elo);
+            continue;
+        }
         const r = computeMatch(rec.elo, rec.rank, m.score, m.duration);
         m.change = r.eloChange;
         rec.elo = r.newElo;
@@ -238,7 +296,7 @@ function recomputePlayer(rec) {
     }
 }
 
-const visibleMatches = (rec) => rec.matches.filter(m => !m.cancelled);
+const visibleMatches = (rec) => rec.matches.filter(m => !m.cancelled && !m.manual);
 const publicMatch = (m) => ({ score: m.score, duration: m.duration, change: m.change, time: m.time });
 
 // ---------------------------------------------------------------------------
@@ -274,6 +332,9 @@ function requireAdmin(req, res, next) {
 // ---------------------------------------------------------------------------
 // API publique
 // ---------------------------------------------------------------------------
+// Used by an uptime monitor to keep the free Render server awake. It does not touch the database.
+app.get('/health', (req, res) => res.type('text').send('ok'));
+
 app.get('/api/playerdata', (req, res) => {
     const playerId = req.query.playerId;
     if (typeof playerId !== 'string' || !ID_RE.test(playerId)) {
@@ -284,7 +345,7 @@ app.get('/api/playerdata', (req, res) => {
     const rec = db[playerId];
     const player = rec
         ? { id: rec.publicId, name: rec.name, elo: rec.elo, rank: rec.rank,
-            position: all.indexOf(rec) + 1, matches: visibleMatches(rec).slice(-5).map(publicMatch) }
+            position: all.indexOf(rec) >= 0 ? all.indexOf(rec) + 1 : null, matches: visibleMatches(rec).slice(-5).map(publicMatch) }
         : { id: publicIdOf(playerId), name: 'Player', elo: 0, rank: 'Bronze', position: null, matches: [] };
 
     const leaderboard = all.slice(0, LIMITS.LEADERBOARD_SIZE)
@@ -323,10 +384,10 @@ app.post('/api/matches/submit', async (req, res) => {
         if (dup) return res.json({ success: true, eloChange: dup.change, newElo: rec.elo, newRank: rec.rank, duplicate: true });
     }
 
-    const { eloChange, oldRank } = applyMatch(rec, score, duration, gameId);
+    const { eloChange, oldRank } = applyMatch(rec, score, duration, gameId, cleanServer(b.server));
     persistPlayer(playerId);   // saved in the background (with retries): the player never waits for the database
 
-    console.log(`[MATCH] ${rec.name} | Old rank: ${oldRank} | Score: ${score} | Duration: ${duration}s | Delta: ${eloChange} | Total: ${rec.elo} Elo (${rec.rank})`);
+    console.log(`[MATCH] ${rec.name} | Server: ${cleanServer(b.server) || '?'}${cleanServer(b.server) && !OFFICIAL_SERVERS.includes(cleanServer(b.server)) ? ' (NOT OFFICIAL)' : ''} | Old rank: ${oldRank} | Score: ${score} | Duration: ${duration}s | Delta: ${eloChange} | Total: ${rec.elo} Elo (${rec.rank})`);
     res.json({ success: true, eloChange, newElo: rec.elo, newRank: rec.rank });
 });
 
@@ -354,6 +415,50 @@ app.post('/api/admin/reset', requireAdmin, async (req, res) => {
     res.json({ success: true });
 });
 
+app.get('/api/admin/players', requireAdmin, (req, res) => {
+    const rows = Object.values(db).map(p => ({
+        publicId: p.publicId, name: p.name, elo: p.elo, rank: p.rank, hidden: p.hidden === true,
+        games: p.matches.filter(m => !m.cancelled).length,
+        last: p.matches.length ? p.matches[p.matches.length - 1].at || 0 : 0
+    }));
+    rows.sort((a, b) => b.last - a.last);
+    res.json({ success: true, players: rows });
+});
+
+// Adds (or removes, with a negative number) a fixed amount of Elo. It is saved as a "manual" entry in the match list,
+// so you can see it, cancel it, and it survives every recalculation.
+app.post('/api/admin/adjust', requireAdmin, async (req, res) => {
+    const { publicId, amount, note } = req.body || {};
+    const found = findByPublicId(publicId);
+    const n = Math.round(Number(amount));
+    if (!found || !Number.isFinite(n) || n === 0 || Math.abs(n) > 20000) {
+        return res.status(400).json({ success: false, error: 'Invalid parameters (amount must be a non-zero number, max 20000)' });
+    }
+    const [uuid, rec] = found;
+    rec.matches.push({
+        id: crypto.randomUUID(), gameId: null, manual: true,
+        note: typeof note === 'string' ? note.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 60) : '',
+        score: 0, duration: 0, change: n,
+        time: new Date().toLocaleTimeString('en-GB'), at: Date.now(), cancelled: false
+    });
+    rec.elo = Math.max(0, rec.elo + n);
+    rec.rank = rankFromElo(rec.elo);
+    await persistPlayer(uuid);
+    console.log(`[ADMIN] Manual adjustment for ${rec.name}: ${n >= 0 ? '+' : ''}${n} Elo. New total: ${rec.elo} Elo (${rec.rank})`);
+    res.json({ success: true, newElo: rec.elo, newRank: rec.rank });
+});
+
+// Hides a player from the leaderboard (nothing is deleted, it can be restored).
+app.post('/api/admin/player', requireAdmin, async (req, res) => {
+    const { publicId, hidden } = req.body || {};
+    const found = findByPublicId(publicId);
+    if (!found || typeof hidden !== 'boolean') return res.status(400).json({ success: false, error: 'Invalid parameters' });
+    found[1].hidden = hidden;
+    await persistPlayer(found[0]);
+    console.log(`[ADMIN] Player ${found[1].name} (${publicId}) ${hidden ? 'hidden' : 'restored'}.`);
+    res.json({ success: true });
+});
+
 app.get('/api/admin/matches', requireAdmin, (req, res) => {
     const rows = [];
     for (const rec of Object.values(db)) {
@@ -361,7 +466,7 @@ app.get('/api/admin/matches', requireAdmin, (req, res) => {
             rows.push({
                 publicId: rec.publicId, player: rec.name, matchId: m.id,
                 score: m.score, duration: m.duration, change: m.change,
-                time: m.time, at: m.at, cancelled: m.cancelled,
+                time: m.time, at: m.at, cancelled: m.cancelled, manual: m.manual === true, note: m.note || '', server: m.server || '', official: !m.server || OFFICIAL_SERVERS.includes(m.server),
                 elo: rec.elo, rank: rec.rank
             });
         }
@@ -417,8 +522,14 @@ app.get('/admin', (req, res) => {
         <button id="refresh">Refresh</button>
     </div>
     <div id="status"></div>
+    <h2 style="font-size:16px;color:#94a3b8;margin:18px 0 8px;">Players (most recently active first)</h2>
     <table>
-        <thead><tr><th>Date</th><th>Player</th><th>Score</th><th>Duration</th><th>Pts/min</th><th>Elo change</th><th>Current Elo</th><th>Status</th><th></th></tr></thead>
+        <thead><tr><th>Player</th><th>Rank</th><th>Elo</th><th>Games</th><th>ID</th><th>Status</th><th></th></tr></thead>
+        <tbody id="players"></tbody>
+    </table>
+    <h2 style="font-size:16px;color:#94a3b8;margin:18px 0 8px;">Recent matches</h2>
+    <table>
+        <thead><tr><th>Date</th><th>Player</th><th>Score</th><th>Duration</th><th>Pts/min</th><th>Server</th><th>Elo change</th><th>Current Elo</th><th>Status</th><th></th></tr></thead>
         <tbody id="rows"></tbody>
     </table>
     <script>
@@ -444,6 +555,8 @@ app.get('/admin', (req, res) => {
             sessionStorage.setItem('adminKey', key);
             allMatches = (await r.json()).matches;
             render();
+            var pr = await api('/api/admin/players');
+            if (pr.ok) renderPlayers((await pr.json()).players);
         }
 
         function cell(tr, text, cls) {
@@ -461,19 +574,20 @@ app.get('/admin', (req, res) => {
             tbody.textContent = '';
             allMatches.forEach(function(m) {
                 var ppm = Math.round(m.score / (Math.max(m.duration, 1) / 60));
-                var flagged = ppm >= PPM_WARN;
+                var flagged = !m.manual && (ppm >= PPM_WARN || !m.official);
                 if (q && m.player.toLowerCase().indexOf(q) === -1) return;
                 if (onlyFlag && !flagged) return;
                 var tr = document.createElement('tr');
                 if (m.cancelled) tr.className = 'cancelled'; else if (flagged) tr.className = 'flagged';
                 cell(tr, m.at ? new Date(m.at).toLocaleString('en-GB') : m.time);
                 cell(tr, m.player, 'name');
-                cell(tr, m.score.toLocaleString('en-GB'));
-                cell(tr, m.duration + 's');
-                cell(tr, ppm.toLocaleString('en-GB') + (flagged ? ' ⚠' : ''));
+                cell(tr, m.manual ? 'MANUAL' : m.score.toLocaleString('en-GB'));
+                cell(tr, m.manual ? (m.note || '-') : m.duration + 's');
+                cell(tr, m.manual ? '-' : ppm.toLocaleString('en-GB') + (flagged ? ' ⚠' : ''));
+                cell(tr, m.manual ? '-' : (m.server || '?') + (m.official ? '' : ' ⚠'));
                 cell(tr, m.cancelled ? '-' : (m.change >= 0 ? '+' : '') + m.change);
                 cell(tr, m.elo + ' (' + m.rank + ')');
-                cell(tr, m.cancelled ? 'Cancelled' : 'Counted');
+                cell(tr, m.cancelled ? 'Cancelled' : (m.manual ? 'Manual' : 'Counted'));
                 var td = document.createElement('td');
                 var btn = document.createElement('button');
                 btn.textContent = m.cancelled ? 'Restore' : 'Cancel';
@@ -484,6 +598,43 @@ app.get('/admin', (req, res) => {
                 tbody.appendChild(tr);
             });
             if (!tbody.children.length) setStatus('No matches to show.');
+        }
+
+        function renderPlayers(list) {
+            var tb = document.getElementById('players');
+            tb.textContent = '';
+            list.forEach(function(p) {
+                var tr = document.createElement('tr');
+                if (p.hidden) tr.className = 'cancelled';
+                cell(tr, p.name, 'name'); cell(tr, p.rank); cell(tr, p.elo); cell(tr, p.games); cell(tr, p.publicId);
+                cell(tr, p.hidden ? 'Hidden' : 'Visible');
+                var td = document.createElement('td');
+                var b = document.createElement('button');
+                b.textContent = p.hidden ? 'Restore' : 'Hide';
+                if (!p.hidden) b.className = 'danger';
+                b.onclick = async function() {
+                    var msg = (p.hidden ? 'Restore' : 'Hide from leaderboard') + ' ONLY this profile?\n\n' + p.name + ' | ' + p.rank + ' | ' + p.elo + ' Elo | ' + p.games + ' games | id ' + p.publicId;
+                    if (!confirm(msg)) return;
+                    var r = await api('/api/admin/player', { publicId: p.publicId, hidden: !p.hidden });
+                    if (!r.ok) { alert('Error ' + r.status); return; }
+                    await load();
+                };
+                var add = document.createElement('button');
+                add.textContent = '+/- Elo';
+                add.style.marginLeft = '6px';
+                add.onclick = async function() {
+                    var v = prompt('Add Elo to ' + p.name + ' (' + p.rank + ', ' + p.elo + ' Elo, id ' + p.publicId + ').\nType a number (use a minus sign to remove):');
+                    if (v === null || v === '') return;
+                    var amount = Number(v);
+                    if (!isFinite(amount) || amount === 0) { alert('Not a valid number'); return; }
+                    var note = prompt('Short reason (optional, shown in the list):') || '';
+                    if (!confirm('Give ' + (amount > 0 ? '+' : '') + amount + ' Elo to ' + p.name + ' (' + p.publicId + ')?')) return;
+                    var r = await api('/api/admin/adjust', { publicId: p.publicId, amount: amount, note: note });
+                    if (!r.ok) { alert('Error ' + r.status); return; }
+                    await load();
+                };
+                td.appendChild(b); td.appendChild(add); tr.appendChild(td); tb.appendChild(tr);
+            });
         }
 
         async function toggle(m) {
