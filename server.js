@@ -40,6 +40,8 @@ const HIGH_RANKS = ['Mythic', 'Legendary', 'Master']; // ranks where a big game 
 
 // Official ranked game servers. A game played elsewhere is still saved, but flagged in /admin so you can cancel it.
 const OFFICIAL_SERVERS = ['92.222.100.202:444', '198.244.231.35:444', '57.129.37.42:444'];
+// Games that ENDED before this date are refused (set IGNORE_BEFORE=2026-11-07T14:00:00Z in Render to drop games played during a pause).
+const IGNORE_BEFORE = Date.parse(process.env.IGNORE_BEFORE || '') || 0;
 const cleanServer = (v) => (typeof v === 'string' && /^[0-9a-zA-Z.:\[\]-]{3,60}$/.test(v)) ? v : '';
 
 const rankByName = (name) => RANKS.find(r => r.name === name) || RANKS[0];
@@ -366,6 +368,12 @@ app.post('/api/matches/submit', async (req, res) => {
     const duration = Math.floor(Number(b.durationSeconds));
     if (!Number.isFinite(score) || score <= 0 || !Number.isFinite(duration) || duration <= 0) {
         return res.status(400).json({ success: false, error: 'Invalid data' });
+    }
+
+    const endedAt = Date.parse(b.timestamp);
+    if (IGNORE_BEFORE && Number.isFinite(endedAt) && endedAt < IGNORE_BEFORE) {
+        console.log(`[IGNORED] Game of ${cleanNickname(b.nickname)} (${score} pts) ended before IGNORE_BEFORE, not counted.`);
+        return res.json({ success: false, error: 'Game played during maintenance, not counted' });
     }
 
     let rec = db[playerId];
